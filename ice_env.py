@@ -8,16 +8,18 @@ np.set_printoptions(suppress=True, precision=2)
 
 class IcingEnv(gym.Env):
     """
-    更新后的输电线路覆冰仿真环境（加入预警状态追踪与合规考核）
+    更新后的输电线路覆冰仿真环境（加入预警状态追踪、合规考核、安全互锁与存活奖励）
     """
 
     def __init__(
             self,
             data_path: str = "cold_wave_data.csv",
             *,
-            warn_ice_thickness: float = 3.0,
+            # 【关键修改 1】：阈值反转。必须先达到预警线 (1.0)，才有可能达到融冰线 (3.0)
+            warn_ice_thickness: float = 1.0,
             critical_ice_thickness: float = 6.0,
             deice_amount: float = 2.0,
+            min_deice_thickness: float = 3.0,  # 冰厚达到 3.0 才能开启大功率融冰
             random_start: bool = False,
             random_start_max_hours: int = 24,
             temp_bias: float = 0.0,
@@ -32,8 +34,7 @@ class IcingEnv(gym.Env):
 
         self.action_space = spaces.Discrete(3)
 
-        # 【修改点 1】：状态空间从 6 维增加到 7 维
-        # 新增最后一维：预警状态 (0.0 表示未预警，1.0 表示已预警)
+        # 状态空间增加到 7 维：最后一位是预警状态 (0.0/1.0)
         low = np.array([-30.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
         high = np.array([40.0, 35.0, 90.0, 100.0, 1000.0, 50.0, 1.0], dtype=np.float32)
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
@@ -41,6 +42,7 @@ class IcingEnv(gym.Env):
         self.warn_ice_thickness = float(warn_ice_thickness)
         self.critical_ice_thickness = float(critical_ice_thickness)
         self.deice_amount = float(deice_amount)
+        self.min_deice_thickness = float(min_deice_thickness)
         self.random_start = bool(random_start)
         self.random_start_max_hours = int(random_start_max_hours)
 
@@ -63,7 +65,6 @@ class IcingEnv(gym.Env):
 
         self.current_step = 0
         self.current_ice_thickness = 0.0
-        # 【修改点 2】：增加环境内部的预警状态变量
         self.is_warned = False
         self.state = None
 
@@ -77,7 +78,6 @@ class IcingEnv(gym.Env):
             self.current_step = 0
 
         self.current_ice_thickness = 0.0
-        # 每集重置时，解除预警状态
         self.is_warned = False
         self.state = self._get_observation()
         return self.state, {}
@@ -90,7 +90,6 @@ class IcingEnv(gym.Env):
         humidity = float(row["humidity"]) + self.humidity_bias
         line_current = float(row["line_current"])
 
-        # 【修改点 3】：将预警状态加入到返回的观测张量中
         return np.array(
             [
                 temp,
@@ -104,8 +103,8 @@ class IcingEnv(gym.Env):
             dtype=np.float32,
         )
 
+    # 这里的旧 _action_cost 方法已经被弃用，成本计算移到了 step 函数内，可以保留也可以删掉。
     def _action_cost(self, action: int, line_current: float) -> float:
-        # 预警成本。如果是重复预警，依然扣费（防止智能体一直无脑刷动作 1）
         if action == 1:
             return 1.0
         if action == 2:
@@ -116,7 +115,6 @@ class IcingEnv(gym.Env):
     def step(self, action):
         action = int(action)
 
-        # 【修改点 4】：智能体执行了预警动作，更新环境状态
         if action == 1:
             self.is_warned = True
 
@@ -141,15 +139,32 @@ class IcingEnv(gym.Env):
             ice_growth = -0.5
 
         ice_growth *= self.ice_growth_scale
-
         self.current_ice_thickness += ice_growth
 
+        # 【关键修改 2】：安全互锁与动作成本解耦
+        """
+        当它在没冰的时候瞎按，系统只会轻轻拍一下它的手（扣 1 分），告诉它现在按没用。
+        这种极其温和的惩罚，保护了它的探索欲。
+        等到冰真的结到 3.0 毫米以上时，它依然有胆量去尝试融冰，
+        并最终发现融冰能帮它活到最后、赚取丰厚的存活奖励。
+        """
         deice_effect = 0.0
+        current_factor = 0.5 + (max(0.0, line_current) / 500.0)
+        base_melt_cost = 10.0 * current_factor
+
         if action == 2:
-            deice_effect = -self.deice_amount
-            self.current_ice_thickness += deice_effect
-            # 融冰后通常意味着危机解除，这里我们可以选择自动重置预警状态
-            # self.is_warned = False
+            if self.current_ice_thickness >= self.min_deice_thickness:
+                deice_effect = -self.deice_amount
+                self.current_ice_thickness += deice_effect
+                action_cost = base_melt_cost # 融冰成功，扣除高额成本
+                # self.is_warned = False # 可选：融冰后重置预警状态
+            else:
+                deice_effect = 0.0
+                action_cost = 1.0  # 触发安全互锁，只象征性扣 1 分误操作费
+        elif action == 1:
+            action_cost = 1.0      # 预警扣 1 分
+        else:
+            action_cost = 0.0      # 无操作扣 0 分
 
         self.current_ice_thickness = max(0.0, self.current_ice_thickness)
 
@@ -158,29 +173,32 @@ class IcingEnv(gym.Env):
 
         hazard = bool(self.current_ice_thickness >= self.critical_ice_thickness)
 
-        # 【修改点 5】：方案 A 核心落地 —— 预警减免灾害惩罚
+        # 【关键修改 3】：大幅度提高死亡惩罚
         if hazard:
-            # 如果断线了，但之前预警过，给它一个“宽大处理” (-0.3)；毫无准备的断线则重罚 (-1.0)
-            risk_component = -0.3 if self.is_warned else -1.0
+            risk_component = -5.0 if self.is_warned else -20.0
         else:
             risk_component = 0.0
 
         reliability_component = -float(self.current_ice_thickness / self.critical_ice_thickness)
         reliability_component = float(np.clip(reliability_component, -2.0, 0.0))
 
-        # 【修改点 6】：合规惩罚 —— 倒逼开口
         compliance_penalty = 0.0
         if self.current_ice_thickness >= self.warn_ice_thickness and not self.is_warned:
-            # 到了该报告的厚度却装死，每步额外扣分！
             compliance_penalty = -0.5
 
-        cost = float(self._action_cost(action, line_current))
+        # 使用我们上面单独计算的 action_cost，而不是去调旧函数
+        cost = float(action_cost)
 
+        # 【关键修改 4】：存活奖励
+        survival_bonus = 0.0 if hazard else 5.0
+
+        # 【关键修改 5】：把所有奖励全部加起来
         reward = (
                 self.w_risk * risk_component
                 + self.w_reliability * reliability_component
-                + self.w_reliability * compliance_penalty  # 将合规扣分计入总奖励
+                + self.w_reliability * compliance_penalty
                 - self.w_cost * cost
+                + survival_bonus  # 加上存活奖励
         )
 
         terminated = bool(hazard)
@@ -191,7 +209,7 @@ class IcingEnv(gym.Env):
             "ice_growth": float(ice_growth),
             "deice_effect": float(deice_effect),
             "hazard": bool(hazard),
-            "is_warned": bool(self.is_warned),  # 记录状态供分析
+            "is_warned": bool(self.is_warned),
             "risk_component": float(risk_component),
             "reliability_component": float(reliability_component),
             "compliance_penalty": float(compliance_penalty),
